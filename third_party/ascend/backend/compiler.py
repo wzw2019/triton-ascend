@@ -165,6 +165,8 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             compile_on_910_95
         )
         if metadata["enable_dynamic_cv_pipeline"]:
+            metadata["enable_mixed_cv"] = True
+            metadata["disable_auto_inject_block_sync"] = True
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
 
         _val = metadata.get("intra_cache_num")
