@@ -43,6 +43,9 @@ from triton.backends.ascend.utils import (
     force_disable_ffts,
     get_backend_func
 )
+# Bind the already-imported utils module once so the launch hot path can write
+# TRITON_PROFILER_REGISTERED without a per-launch `import triton` + attribute walk.
+import triton.backends.ascend.utils as _ascend_utils
 
 class NPUUtils(object):
     def __new__(cls):
@@ -136,9 +139,9 @@ class NPULauncher(object):
         else:
             if self.compile_only:
                 return
+  
             profiler_registered = self.launch(*args, **kwargs)
-            import triton
-            triton.backends.ascend.utils.TRITON_PROFILER_REGISTERED = True if profiler_registered == 1 else False
+            _ascend_utils.TRITON_PROFILER_REGISTERED = (profiler_registered == 1)
 
 class NPUDriver(DriverBase):
     def __init__(self):
@@ -493,8 +496,8 @@ def generate_npu_wrapper_src(constants, signature, metadata):
     """
     args:
         int gridX, gridY, gridZ;
-        rtStream_t stream;
-        const void *functon;
+        aclrtStream stream;
+        aclrtFuncHandle functon;
         PyObject* packed_metadata, *launch_metadata;
         PyObject* launch_enter_hook, *launch_exit_hook;
         *args_expand
@@ -555,27 +558,6 @@ static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {
     ptr_info.dev_ptr = reinterpret_cast<void *>(PyLong_AsUnsignedLongLong(ret));
     if(!ptr_info.dev_ptr)
       return ptr_info;
-    aclrtPtrAttributes attributes;
-    aclError status = aclrtPointerGetAttributes(ptr_info.dev_ptr, &attributes);
-
-    if (status == ACL_SUCCESS) {
-      if (attributes.location.type != ACL_MEM_LOCATION_TYPE_DEVICE && attributes.location.type != 4) {
-        Py_DECREF(ret);
-        PyErr_Format(PyExc_ValueError,
-                     "Pointer argument (at %d) cannot be accessed from Triton (cpu tensor?)", idx);
-        ptr_info.valid = false;
-        return ptr_info;
-      }
-    } else {
-      Py_DECREF(ret);
-      PyErr_Format(PyExc_RuntimeError,
-                   "Failed to query pointer attributes at argument %d. "
-                   "Error code: %d. This may indicate invalid memory address "
-                   "or NPU device error.",
-                   idx, status);
-      ptr_info.valid = false;
-      return ptr_info;
-      }
     Py_DECREF(ret);
     return ptr_info;
   }
@@ -593,6 +575,8 @@ extern "C" {
   extern int MsprofRegisterCallback(unsigned int moduleId, callback handle);
   static unsigned int __MsprofFlagL0  = 0;
   static unsigned int __MsprofFlagL1  = 0;
+  static const char* kernelName = nullptr ;
+  static std::vector<int> tensorKinds;
 
   int ProfCtrlHandle(unsigned int CtrlType, void* CtrlData, unsigned int DataLen) {
     if ((CtrlData == nullptr) || (DataLen == 0U)) {
@@ -730,16 +714,21 @@ extern "C" {
 """
 
     cpp_kernel_launch = f"""
-    ret = rtKernelLaunch(func, blockNum, static_cast<void*>(&args), sizeof(args), NULL, stream);
+    ret = aclrtLaunchKernelWithHostArgs(func, blockNum, stream, nullptr, &args, sizeof(args), nullptr, 0);
 """
     if compile_on_910_95 and enable_simt:
         cpp_kernel_launch = f"""
-    rtArgsEx_t argsInfo = {{}};
-    argsInfo.args = static_cast<void*>(&args);
-    argsInfo.argsSize = sizeof(args);
-    rtTaskCfgInfo_t cfgInfo = {{}};
-    cfgInfo.localMemorySize = {metadata.shared_mem_dynamic_size};
-    ret = rtKernelLaunchWithFlagV2(func, blockNum, &argsInfo, NULL, stream, 0, &cfgInfo);
+    aclrtLaunchKernelAttr attrInfo = {{}};
+    attrInfo.id = ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE;
+    aclrtLaunchKernelAttrValue value = {{}};
+    value.localMemorySize = {metadata.shared_mem_dynamic_size};
+    attrInfo.value = value;
+    
+    aclrtLaunchKernelCfg cfgCfgInfo = {{}};
+    cfgCfgInfo.attrs = &attrInfo;
+    cfgCfgInfo.numAttrs = 1;
+    
+    ret = aclrtLaunchKernelWithHostArgs(func, blockNum, stream, &cfgCfgInfo,  &args, sizeof(args) , nullptr, 0);
 """
 
     precompile_headers = f"""
@@ -760,12 +749,11 @@ extern "C" {
 
 {cpp_device_pointer}
 
-static void _launch(const char* kernelName, const void* func, rtStream_t stream, int gridX, int gridY, int gridZ, std::vector<std::vector<int64_t>> &tensorShapes, std::vector<int> &tensorKinds{', ' + arg_decls if len(signature) > 0 else ''}) {{
+static void _launch(const char* kernelName, aclrtFuncHandle func, aclrtStream stream, int gridX, int gridY, int gridZ, std::vector<std::vector<int64_t>> &tensorShapes, std::vector<int> &tensorKinds{', ' + arg_decls if len(signature) > 0 else ''}) {{
   // only 1D parallelization is supported for NPU
   // Pointer type becomes flattend 1-D Memref tuple: base_ptr, data_ptr, offset, shape, stride
   // base_ptr offset shape and stride are not used, arbitrarily set for now
-  std::string name = "";
-  name.append(kernelName);
+  static std::string name(kernelName);
   void *workspace_addr_ptr = NULL;
   uint32_t blockNum4Workspace = gridX * gridY * gridZ;
   {get_backend_func("pre_launch", True)}
@@ -773,7 +761,7 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
   uint64_t totalWorkSpaceSize = {workspace_size} * blockNum4Workspace;
   {get_backend_func("allocate_memory", "totalWorkSpaceSize", "stream")}
   ''' if workspace_size > 0 else ''}
-  {'auto launch_call = [=]() -> rtError_t' if enable_taskqueue else ''} {{
+  {'auto launch_call = [=]() -> aclError' if enable_taskqueue else ''} {{
     {get_backend_func("pre_launch", False)}
     uint32_t blockNum = gridX * gridY * gridZ;
 
@@ -790,9 +778,9 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
     uint32_t nodeBasicBlockDim = (mixBlockNumRation << 16) + blockNum;
 
     {'cce::internal::DebugTunnelData *DTData = cce::internal::DebugTunnel::Open(blockNum);' if enable_device_print else ''}
-    rtError_t ret = RT_ERROR_NONE;
-    {'void *ffts_addr = NULL; uint32_t ffts_len; ret = rtGetC2cCtrlAddr((uint64_t*)&ffts_addr, &ffts_len);' if target_support_ffts else ''}
-    {'if (ret != RT_ERROR_NONE) return ret;' if (target_support_ffts and enable_taskqueue) else 'if (ret != RT_ERROR_NONE) return;' if (target_support_ffts and (not enable_taskqueue)) else ''}
+    aclError ret = ACL_SUCCESS;
+    {'void *ffts_addr = NULL; uint32_t ffts_len; ret = aclrtGetHardwareSyncAddr(&ffts_addr);' if target_support_ffts else ''}
+    {'if (ret != ACL_SUCCESS) return ret;' if (target_support_ffts and enable_taskqueue) else 'if (ret != ACL_SUCCESS) return;' if (target_support_ffts and (not enable_taskqueue)) else ''}
     // stub argument for workspace
     void *syncBlockLock_ptr = NULL;
     uint16_t ModuleId = 0;
@@ -803,16 +791,16 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
       {alloc_success_code if enable_taskqueue else sync_lock_fail_code}
     }}
     std::vector<int64_t> lockInitData({lock_num}, {lock_init_value});
-    ret = rtMemcpy(
+    ret = aclrtMemcpy(
         syncBlockLock_ptr, syncBlockLockSize,
         reinterpret_cast<void *>(lockInitData.data()), syncBlockLockSize,
-        RT_MEMCPY_HOST_TO_DEVICE
+        ACL_MEMCPY_HOST_TO_DEVICE
     );
-    if (ret != RT_ERROR_NONE) {{
+    if (ret != ACL_SUCCESS) {{
       return {'ret' if enable_taskqueue else ''};
     }}
     ''' if lock_num > 0 else ''}
-    {'if (ret != RT_ERROR_NONE) return ret;' if (workspace_size > 0 and enable_taskqueue) else 'if (ret != RT_ERROR_NONE) return;' if (workspace_size > 0 and not enable_taskqueue) else ''}
+    {'if (ret != ACL_SUCCESS) return ret;' if (workspace_size > 0 and enable_taskqueue) else 'if (ret != ACL_SUCCESS) return;' if (workspace_size > 0 and not enable_taskqueue) else ''}
     struct __attribute__((packed)) {{
       {'void* ffts_addr __attribute__((aligned(8)));' if target_support_ffts else ''}
       {'void* syncBlockLock __attribute__((aligned(8)));' if not metadata.force_simt_only else ''}
@@ -835,7 +823,7 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
     {'void *&stream_ref = const_cast<void*&>(stream);' if enable_device_print else ''}
     {'cce::internal::DebugTunnel::Close(DTData, stream_ref);' if enable_device_print else ''}
     {cpp_msprof_call_after_launch}
-    {'return ret;' if enable_taskqueue else 'ret = rtStreamSynchronize(stream);'}
+    {'return ret;' if enable_taskqueue else 'ret = aclrtSynchronizeStream(stream);'}
    }};
    {f'''{get_backend_func("async_launch", "launch_call") if enable_taskqueue else ''}'''}
   return;
@@ -874,8 +862,8 @@ static std::vector<int64_t> _get_tensor_shape(PyObject *tensor) {{
 
 static PyObject* launch(PyObject* self, PyObject* args) {{
   int gridX, gridY, gridZ;
-  rtStream_t stream;
-  const void *function;
+  aclrtStream stream;
+  aclrtFuncHandle function;
   PyObject *packedMetadata = NULL;
   PyObject *launch_metadata = NULL;
   PyObject *launch_enter_hook = NULL;
@@ -911,17 +899,20 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   }}
 
   // get kernel_name
-  PyObject *kernelNameObj = PyDict_GetItemString(packedMetadata, "kernel_name");
-  const char *kernelName = PyUnicode_AsUTF8(kernelNameObj);
+  if (!kernelName) {{
+      PyObject *kernelNameObj = PyDict_GetItemString(packedMetadata, "kernel_name");
+      kernelName = PyUnicode_AsUTF8(kernelNameObj);
+  }}
   // get tensor_kinds
-  std::vector<int> tensorKinds;
-  PyObject *tensorKindList = PyDict_GetItemString(packedMetadata, "tensor_kinds");
-  if (tensorKindList) {{
-    int size = PyObject_Size(tensorKindList);
-    for (int i = 0; i < size; i++) {{
-      PyObject *kind = PySequence_GetItem(tensorKindList, i);
-      tensorKinds.push_back(PyLong_AsLong(kind));
-    }}
+  if( tensorKinds.empty() ) {{
+     PyObject *tensorKindList = PyDict_GetItemString(packedMetadata, "tensor_kinds");
+     if (tensorKindList) {{
+       int size = PyObject_Size(tensorKindList);
+       for (int i = 0; i < size; i++) {{
+         PyObject *kind = PySequence_GetItem(tensorKindList, i);
+         tensorKinds.push_back(PyLong_AsLong(kind));
+       }}
+     }}
   }}
 
   // raise exception asap
